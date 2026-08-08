@@ -1,0 +1,16 @@
+# backups
+*.bak
+*.bak-*
+*~
+
+# editors
+.vscode/
+.idea/
+
+# python
+__pycache__/
+*.pyc
+
+# Nextcloud sync artefacts
+.nextcloudsync.log
+*.sync-conflict-*
