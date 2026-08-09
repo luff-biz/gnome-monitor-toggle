@@ -16,8 +16,8 @@
 # ---------------------------------------------------------------------------
 # WHAT THIS IS FOR
 # ---------------------------------------------------------------------------
-# The amdgpu driver sometimes wedges the display pipeline. The journal then
-# shows something like:
+# On some AMD systems the display pipeline wedges. The journal then shows
+# something like:
 #
 #     amdgpu 0000:c4:00.0: [drm] *ERROR* [CRTC:428:crtc-1] flip_done timed out
 #
@@ -34,6 +34,13 @@
 #
 # If you see flip_done WITHOUT an accompanying GPU reset, this script may
 # help you.
+#
+# NOTE ON THE CAUSE: it is NOT established that this is an amdgpu bug. The
+# failure surfaces in amdgpu's display code, but the only machine it has been
+# reproduced on drives its monitors through a Thunderbolt dock, over MST,
+# with DSC, on a bandwidth-saturated USB4 link -- any of which could be the
+# real trigger. See the README for the evidence and for how to help narrow
+# it down.
 #
 # ---------------------------------------------------------------------------
 # WHY TARGETS ARE MATCHED BY MODEL NAME, NOT DP NUMBER

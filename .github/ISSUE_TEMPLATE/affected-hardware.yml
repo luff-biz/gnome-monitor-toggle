@@ -6,10 +6,15 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting. It is currently unknown how far this bug
-        reaches — which APU generations, which kernels, and whether a dock or
-        a particular monitor is needed to trigger it. Every data point helps,
-        **including negative ones**.
+        Thanks for reporting. The root cause is **not established**. The
+        failure surfaces in amdgpu's display code, but the only machine it has
+        been reproduced on drives its monitors through a Thunderbolt dock,
+        over MST, with DSC, on a bandwidth-saturated USB4 link — so the driver
+        may not be the culprit at all.
+
+        The single most valuable report right now is one where the monitor is
+        **connected directly, without a dock**. That would separate the two
+        hypotheses. Every data point helps, **including negative ones**.
 
   - type: textarea
     id: specs
@@ -31,14 +36,40 @@ body:
           echo "BIOS:    $(cat /sys/class/dmi/id/bios_version) $(cat /sys/class/dmi/id/bios_date)"
           echo "Session: ${XDG_SESSION_TYPE:-unknown} / $(gnome-shell --version)"
           echo
-          echo "### Monitors"
+          echo "### Monitors and modes"
           ./monitor-toggle.sh --list
+          gdctl show 2>/dev/null | grep -E "Monitor |[0-9]+x[0-9]+@" | sed 's/^ *//'
+          echo
+          echo "### Dock / link (empty means no Thunderbolt/USB4 dock)"
+          command -v boltctl >/dev/null \
+            && boltctl list 2>/dev/null | grep -E "^ \*|generation:|rx speed:|tx speed:" \
+            || echo "  boltctl not installed"
+          echo
+          echo "### MST / DSC / link events"
+          journalctl -b 0 -k 2>/dev/null \
+            | grep -iE "MST_DSC|dsc precompute|link training|dp_mst|HPD RX IRQ" | tail -5
           echo
           echo "### Freeze signature (previous boot)"
-          journalctl -b -1 -k 2>/dev/null | grep -E "flip_done|GPU reset|ring .*timeout" | tail -10
+          journalctl -b -1 -k 2>/dev/null \
+            | grep -E "flip_done|GPU reset|ring .*timeout" | tail -10
         }
         ```
       render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: connection
+    attributes:
+      label: How is the affected display connected?
+      description: The most important question in this whole report.
+      options:
+        - "Directly to the machine (no dock, no hub)"
+        - "Through a Thunderbolt / USB4 dock"
+        - "Through a USB-C hub or DisplayPort-Alt adapter"
+        - "Through an MST hub or daisy chain"
+        - "Internal panel only"
+        - "Not sure"
     validations:
       required: true
 
@@ -54,17 +85,26 @@ body:
     validations:
       required: true
 
+  - type: input
+    id: displays
+    attributes:
+      label: Displays, resolution and refresh rate
+      description: How many displays, and at what mode. Bandwidth is a suspect.
+      placeholder: 'e.g. 2 x 3840x2160@120, plus internal panel disabled'
+    validations:
+      required: false
+
   - type: checkboxes
     id: conditions
     attributes:
       label: Which of these apply to your setup?
       options:
-        - label: External display(s) connected
-        - label: Connected through a dock or USB-C/DisplayPort-Alt
         - label: Internal panel disabled (lid closed / turned off)
+        - label: DSC or MST mentioned in the kernel log
         - label: Happens after suspend/resume
         - label: Happens on an idle/blanked screen
         - label: Only ever seen on the internal panel
+        - label: Lowering resolution or refresh rate changed the frequency
 
   - type: textarea
     id: frequency

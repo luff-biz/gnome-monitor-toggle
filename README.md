@@ -1,7 +1,7 @@
 # gnome-monitor-toggle
 
 Briefly turn a single monitor off and back on under GNOME — a workaround for
-amdgpu display freezes (`flip_done timed out`).
+display freezes on AMD systems (`flip_done timed out`).
 
 The change is temporary: nothing is written to your saved monitor
 configuration, and the previous layout is restored exactly, even if you abort
@@ -27,10 +27,10 @@ The symptom is distinctive and easy to misdiagnose:
 - Eventually the GNOME session may die and drop you at the login screen — or
   you power-cycle the machine because nothing else responds.
 
-What is actually happening: the amdgpu driver has wedged its **display
-pipeline**. The GPU itself is fine. It keeps executing work, the compositor
-keeps rendering — the frames just never reach the screen because the atomic
-page flip never completes. The kernel says so:
+What is actually happening: the **display pipeline is wedged**. The GPU itself
+is fine. It keeps executing work, the compositor keeps rendering — the frames
+just never reach the screen because the atomic page flip never completes. The
+kernel says so:
 
 ```
 amdgpu 0000:c4:00.0: [drm] *ERROR* [CRTC:428:crtc-1] flip_done timed out
@@ -47,7 +47,77 @@ is all this script does — via the same D-Bus interface that GNOME Settings
 uses, so it works under Wayland where `xrandr` cannot help you.
 
 This is a workaround, not a fix. You run it *after* a freeze; it does not
-prevent one. The underlying driver bug is unresolved.
+prevent one.
+
+---
+
+## What causes it is an open question
+
+**Please read this before concluding you have "the amdgpu bug".** The failure
+*surfaces* in amdgpu's display code, but that does not mean the driver is the
+root cause, and the setup it was observed on has several other suspects.
+
+On the reference system the two external monitors do **not** hang off a plain
+DisplayPort cable. They run through a **Thunderbolt 5 dock**, which means:
+
+- **DisplayPort tunnelled over USB4**, negotiated at **40 Gb/s**
+  (`2 lanes * 20 Gb/s` — the host is USB4, so 40 Gb/s is the ceiling here
+  regardless of the dock being TB5)
+- **MST** (Multi-Stream Transport) — both displays share one link
+- **DSC** (Display Stream Compression), confirmed by
+  `MST_DSC dsc precompute` in the kernel log
+
+And the bandwidth is genuinely tight. Two 4K@120 streams at 8 bpc need roughly
+24 Gb/s of payload each — about 48 Gb/s combined, on a 40 Gb/s tunnel that
+also carries USB and PCIe traffic. It only fits *because* of DSC.
+**DSC over MST over USB4 tunnelling is one of the most fragile combinations in
+the whole display stack.**
+
+There is also a timing correlation. `HPD RX IRQ` is a *sink-initiated*
+interrupt — the monitor or hub reporting a link status change or a failed link
+training. It clusters tightly around the freezes:
+
+| flip_done timeout | HPD RX IRQ |
+|---|---|
+| 11:36:57 | 11:36:57 — same second |
+| 19:03:31 | 19:03:36 |
+| 09:50:23 | 09:50:26 |
+
+**The direction of causation cannot be determined from the log.** The link
+events might be triggering the stall — or they might be the driver rebuilding
+the link afterwards. Both readings fit the data.
+
+One more hint in the same direction: DP connector numbers on this system
+shifted from `DP-4`/`DP-5` to `DP-6`/`DP-7` at some point. With MST, connectors
+are **created dynamically** when a topology appears, so a re-enumerated dock
+hands out fresh indices. That renumbering was not random driver behaviour — it
+was the dock.
+
+### So: driver, dock, or the combination?
+
+| Hypothesis | Supporting | Against |
+|---|---|---|
+| amdgpu driver bug | Fails inside `amdgpu_dm_commit_planes`; reproduces across ~19 kernel versions | A driver that mishandles a marginal link is not the same as one that wedges on its own |
+| Dock / MST / DSC / USB4 | Bandwidth at the limit; sink-initiated HPD events correlate; MST explains the renumbering | Never tested without the dock |
+| Interaction of both | Explains why it survives every kernel update | Untested |
+
+**Nobody has run this machine without the dock for long enough to tell.** If
+you hit the same freeze on a **directly connected** monitor, that is a
+particularly valuable report — it would separate these hypotheses.
+
+### How to narrow it down on your own machine
+
+Roughly in order of usefulness — each isolates one variable:
+
+1. **Remove the dock.** Connect one monitor straight to the machine. If the
+   freezes stop over several days, the dock/MST/tunnelling path is implicated.
+2. **Drive one display instead of two.** Halves the bandwidth, keeps MST.
+3. **Drop to 60 Hz.** Cuts bandwidth demand sharply. If it goes quiet, this is
+   a bandwidth/DSC problem rather than a driver logic problem.
+4. **Update the dock firmware.**
+
+Please report what you find, positive or negative — see
+[Report your hardware](#report-your-hardware).
 
 ---
 
@@ -72,36 +142,69 @@ usually just the session tearing down afterwards.
 
 ---
 
-## Affected hardware
+## The reference system
 
-**Confirmed** — the system this was developed and reproduced on:
+The one machine this has been reproduced on, in full — including the parts
+that may well be the actual cause:
 
 | | |
 |---|---|
 | Machine | ASUS ROG Flow Z13 (GZ302EAC), BIOS GZ302EAC.301 (2025-10-27) |
 | CPU/APU | AMD Ryzen AI MAX+ 395 w/ Radeon 8060S (**Strix Halo**, `1002:1586`) |
-| Distro | Fedora Linux 44 (Workstation) |
-| Kernel | 7.1.5, 7.1.6 and 7.1.7 — **all affected**, so not a single-version regression |
-| Desktop | GNOME Shell 50.4 / mutter 50.4, Wayland |
+| Distro | Fedora Linux 43, then 44 (Workstation) |
+| Desktop | GNOME Shell / mutter 50.4, Wayland |
 | Mesa | 26.1.6 |
-| Displays | Two external 4K@120 over DisplayPort, internal panel disabled |
+| **Dock** | **Razer Thunderbolt 5 Dock**, link negotiated at **40 Gb/s** (USB4) |
+| Displays | 2 × 4K@120 over **DP tunnelled through the dock**, via **MST** with **DSC** |
+| Internal panel | Disabled (`eDP-1` inactive) |
 
-**Plausibly affected, but unverified.** The code path that fails
-(`amdgpu_dm_commit_planes` in amdgpu's Display Core) is not specific to Strix
-Halo — it is shared by essentially every AMD GPU and APU that uses DC/DCN.
-That covers, among others:
+### Kernel versions
 
-- **APUs:** Strix Halo (Ryzen AI Max 300), Strix Point (Ryzen AI 300),
-  Hawk Point / Phoenix (Ryzen 7040/8040), Rembrandt (Ryzen 6000)
-- **Discrete:** Radeon RX 6000 / 7000 / 9000 series
+The freeze survives every kernel update. It is documented on **32 separate
+days** between 2026-05-03 and 2026-08-09 — that is the full extent of the
+journal retention, not the full extent of the problem.
 
-To be explicit: *sharing a code path is not evidence of the same bug.* Nobody
-has confirmed these are affected. That is precisely why reports are
-wanted — see [Report your hardware](#report-your-hardware) below.
+**Confirmed affected** (freeze present in the log while running these):
 
-If your setup involves external DisplayPort monitors (dock, USB-C/DP-Alt,
-lid closed with the internal panel off), you are in the configuration where
-this was observed.
+```
+6.19.14-300.fc44
+7.0.4    7.0.7    7.0.8    7.0.9    7.0.10    7.0.12    7.0.13
+7.1.4    7.1.5    7.1.6    7.1.7
+```
+
+**Also run, but before journal retention began** — reported by the user as
+already affected, not machine-verifiable:
+
+```
+6.17.1-300.fc43
+6.19.9   6.19.10   6.19.11   6.19.13   (all .fc43)
+```
+
+So: **every kernel series from 6.17 through 7.1**, across a Fedora 43 → 44
+upgrade, spanning roughly April to August 2026. Whatever this is, it is not a
+regression in one kernel version, and no update has fixed it.
+
+## Might this affect other hardware?
+
+Unknown, and deliberately not overstated.
+
+The code path that fails (`amdgpu_dm_commit_planes`, in amdgpu's Display Core)
+is not specific to Strix Halo — it is shared by essentially every AMD GPU and
+APU using DC/DCN, including Strix Point, Hawk Point / Phoenix, Rembrandt and
+the discrete RX 6000/7000/9000 series.
+
+**But sharing a code path is not evidence of the same bug.** And since the
+reference system reaches its displays through a dock, over MST, with DSC, on a
+bandwidth-saturated USB4 tunnel, it is entirely possible that the hardware
+generation is not the relevant variable at all.
+
+The most informative reports would be:
+
+- Same freeze **without** a dock, on a directly attached monitor
+- Same freeze on a **different GPU generation**
+- Same freeze with **plenty of bandwidth headroom** (single display, 60 Hz)
+
+See [Report your hardware](#report-your-hardware).
 
 ---
 
@@ -261,8 +364,9 @@ names in your shortcuts still exist.
 ## Report your hardware
 
 **The most useful thing you can contribute is a data point.** It is currently
-unknown how far this bug reaches — which APU generations, which kernels,
-whether a dock or specific monitor is required to trigger it.
+unknown how far this reaches — which GPU generations, which kernels, and above
+all **whether a dock, MST or DSC is required to trigger it at all**. With one
+affected machine there is no way to separate driver from topology.
 
 If you hit `flip_done timed out` without a GPU reset, please
 [open an issue](https://github.com/luff-biz/gnome-monitor-toggle/issues/new)
@@ -279,23 +383,37 @@ and include the output of this — run it from the repo directory:
   echo "BIOS:    $(cat /sys/class/dmi/id/bios_version) $(cat /sys/class/dmi/id/bios_date)"
   echo "Session: ${XDG_SESSION_TYPE:-unknown} / $(gnome-shell --version)"
   echo
-  echo "### Monitors"
+  echo "### Monitors and modes"
   ./monitor-toggle.sh --list
+  gdctl show 2>/dev/null | grep -E "Monitor |[0-9]+x[0-9]+@" | sed 's/^ *//'
+  echo
+  echo "### Dock / link (empty means no Thunderbolt/USB4 dock)"
+  command -v boltctl >/dev/null \
+    && boltctl list 2>/dev/null | grep -E "^ \*|generation:|rx speed:|tx speed:" \
+    || echo "  boltctl not installed"
+  echo
+  echo "### MST / DSC / link events"
+  journalctl -b 0 -k 2>/dev/null \
+    | grep -iE "MST_DSC|dsc precompute|link training|dp_mst|HPD RX IRQ" | tail -5
   echo
   echo "### Freeze signature (previous boot)"
-  journalctl -b -1 -k 2>/dev/null | grep -E "flip_done|GPU reset|ring .*timeout" | tail -10
+  journalctl -b -1 -k 2>/dev/null \
+    | grep -E "flip_done|GPU reset|ring .*timeout" | tail -10
 }
 ```
 
-It prints nothing secret — machine model, kernel, GPU, monitor models and the
-matching log lines. Read it before pasting if you would rather check.
+It prints nothing secret — machine model, kernel, GPU, monitor models, dock
+model and the matching log lines. Read it before pasting if you would rather
+check.
 
 Also worth mentioning in your report:
 
+- **Is a dock involved, or is the monitor connected directly?** This is the
+  single most valuable detail right now.
 - **Did the toggle actually clear the freeze?** Negative results are just as
   valuable.
-- Does it only happen with **external displays**, a **dock**, or after
-  **suspend/resume**?
+- Resolution and refresh rate, and whether lowering either changes anything.
+- Does it only happen after **suspend/resume**, or on an idle screen?
 - Roughly how often, and does anything reliably trigger it?
 
 ---
