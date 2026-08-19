@@ -168,6 +168,11 @@ OBJ_PATH = "/org/gnome/Mutter/DisplayConfig"
 IFACE    = "org.gnome.Mutter.DisplayConfig"
 APPLY_TEMPORARY = 1  # 0=verify, 1=temporary, 2=persistent
 
+# Never wait forever: this script runs while the display stack is already
+# misbehaving. If mutter does not answer, hanging here would just stack up
+# stuck processes with every further trigger press.
+DBUS_TIMEOUT_MS = 15000
+
 try:
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
 except Exception:
@@ -179,7 +184,7 @@ def get_state():
     try:
         res = bus.call_sync(
             BUS_NAME, OBJ_PATH, IFACE, "GetCurrentState",
-            None, None, Gio.DBusCallFlags.NONE, -1, None,
+            None, None, Gio.DBusCallFlags.NONE, DBUS_TIMEOUT_MS, None,
         )
     except GLib.Error as e:
         sys.stderr.write(
@@ -321,7 +326,7 @@ def apply(cur_serial, lms):
     )
     bus.call_sync(
         BUS_NAME, OBJ_PATH, IFACE, "ApplyMonitorsConfig",
-        args, None, Gio.DBusCallFlags.NONE, -1, None,
+        args, None, Gio.DBusCallFlags.NONE, DBUS_TIMEOUT_MS, None,
     )
 
 
