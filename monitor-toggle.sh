@@ -141,7 +141,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 python3 - "$ACTION" "$TARGET" "$DURATION" <<'PYEOF'
-import sys, time
+import signal, sys, time
 
 try:
     import gi
@@ -162,6 +162,23 @@ try:
 except ValueError:
     sys.stderr.write("Error: SECONDS must be a number.\n")
     sys.exit(1)
+
+if duration < 0:
+    sys.stderr.write("Error: SECONDS must not be negative.\n")
+    sys.exit(1)
+if action == "toggle" and duration < 3:
+    sys.stderr.write("Warning: off-times below ~3 seconds can leave some "
+                     "monitors stuck in standby (see README).\n")
+
+
+def _terminated(signum, frame):
+    # SIGTERM (e.g. session teardown) would otherwise kill the process
+    # without running the finally-block -- the monitor would stay off.
+    # Take the same clean restore path as Ctrl+C.
+    raise KeyboardInterrupt
+
+
+signal.signal(signal.SIGTERM, _terminated)
 
 BUS_NAME = "org.gnome.Mutter.DisplayConfig"
 OBJ_PATH = "/org/gnome/Mutter/DisplayConfig"
