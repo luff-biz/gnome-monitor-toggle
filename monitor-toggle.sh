@@ -122,6 +122,19 @@ if [[ "$TARGET" == "--list" || "$TARGET" == "-l" ]]; then
   TARGET=""
 fi
 
+# Only one toggle at a time. A second instance started during the off-window
+# would snapshot the DISABLED state as its restore target and re-apply it
+# after the first instance has already restored -- leaving the monitor off
+# for good. Easy to trigger by pressing the shortcut twice during a freeze.
+if [[ "$ACTION" == "toggle" ]]; then
+  LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/monitor-toggle.lock"
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    echo "Error: another $SCRIPT_NAME run is already in progress." >&2
+    exit 1
+  fi
+fi
+
 if ! command -v python3 >/dev/null 2>&1; then
   echo "Error: python3 is required but was not found." >&2
   exit 1
@@ -181,7 +194,9 @@ def get_state():
 serial, monitors, logical_monitors, props = get_state()
 
 # connector -> currently active mode id, plus a list of all monitors
-mode_map = {}
+mode_map = {}              # connector -> current mode id
+dims_map = {}              # connector -> (width, height) of the current mode
+pref_map = {}              # connector -> (preferred mode id, preferred scale)
 all_monitors = []          # (connector, vendor, product)
 active_conns = set()
 
@@ -192,6 +207,9 @@ for mon in monitors:
     for mode in mon[1]:    # (id, w, h, refresh, pref_scale, [scales], props)
         if mode[6].get("is-current"):
             mode_map[conn] = mode[0]
+            dims_map[conn] = (mode[1], mode[2])
+        if mode[6].get("is-preferred"):
+            pref_map[conn] = (mode[0], mode[4])
 
 for lm in logical_monitors:
     for mspec in lm[5]:    # (connector, vendor, product, serial)
@@ -312,6 +330,43 @@ def restore():
     fresh_serial = get_state()[0]
     apply(fresh_serial, restore_lms)
 
+
+if target_conn not in active_conns:
+    # The monitor is already off -- e.g. an earlier run died between disable
+    # and restore. Enabling it is the useful thing to do here, not an error.
+    if target_conn not in pref_map:
+        sys.stderr.write(
+            "Error: '%s' is inactive and reports no preferred mode to "
+            "enable it with.\n" % target_conn
+        )
+        sys.exit(1)
+    pref_mode, pref_scale = pref_map[target_conn]
+
+    def lm_width(lm):
+        w, h = dims_map[lm[5][0][0]]
+        if int(lm[3]) in (1, 3, 5, 7):   # 90/270 degree transforms
+            w = h
+        if layout_mode != 2:             # logical layout: scale applies
+            w = round(w / float(lm[2]))
+        return w
+
+    lms = build_lms()
+    rightmost = max(lms, key=lambda lm: lm[0] + lm_width(lm))
+    new_x = rightmost[0] + lm_width(rightmost)
+    lms.append([new_x, rightmost[1], float(pref_scale), 0, False,
+                [(target_conn, pref_mode, {})]])
+    try:
+        apply(serial, lms)
+    except GLib.Error as e:
+        sys.stderr.write(
+            "Error enabling %s: %s\n"
+            "Enable it manually via GNOME Settings -> Displays.\n"
+            % (target_conn, e.message)
+        )
+        sys.exit(1)
+    print("%s was already off -- re-enabled it at its preferred mode "
+          "(temporary, placed right of the current layout)." % target_conn)
+    sys.exit(0)
 
 disabled = False
 try:
