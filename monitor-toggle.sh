@@ -332,8 +332,38 @@ def apply(cur_serial, lms):
 
 def restore():
     # fetch a fresh serial -- it changes after every apply
-    fresh_serial = get_state()[0]
-    apply(fresh_serial, restore_lms)
+    fresh_serial, fresh_monitors, _lms, _props = get_state()
+    try:
+        apply(fresh_serial, restore_lms)
+        return
+    except GLib.Error as first_err:
+        # Connectors can be renumbered while the monitor is off -- MST docks
+        # do this (DP-4/DP-5 became DP-6/DP-7 on the reference system). The
+        # snapshot then references stale connector names and mode ids.
+        # Re-resolve everything by model label and retry once.
+        label_by_conn = {c: label_of(v, p) for c, v, p in all_monitors}
+        conn_by_label = {}
+        fresh_mode = {}
+        for mon in fresh_monitors:
+            spec = mon[0]
+            conn_by_label.setdefault(label_of(spec[1], spec[2]), spec[0])
+            cur = pref = None
+            for mode in mon[1]:
+                if mode[6].get("is-current"):
+                    cur = mode[0]
+                if mode[6].get("is-preferred"):
+                    pref = mode[0]
+            fresh_mode[spec[0]] = cur if cur is not None else pref
+        remapped = []
+        for d in restore_lms:
+            mons = []
+            for c, _mid, _p in d[5]:
+                nc = conn_by_label.get(label_by_conn.get(c, ""), c)
+                if fresh_mode.get(nc) is None:
+                    raise first_err
+                mons.append((nc, fresh_mode[nc], {}))
+            remapped.append([d[0], d[1], d[2], d[3], d[4], mons])
+        apply(get_state()[0], remapped)
 
 
 if target_conn not in active_conns:
@@ -374,6 +404,7 @@ if target_conn not in active_conns:
     sys.exit(0)
 
 disabled = False
+restored = False
 try:
     print("Disabling %s for %g second(s) ..." % (target_conn, duration))
     apply(serial, disable_lms)
@@ -387,11 +418,15 @@ finally:
     if disabled:
         try:
             restore()
+            restored = True
             print("Re-enabling %s." % target_conn)
         except GLib.Error as e:
             sys.stderr.write(
-                "Error restoring %s: %s\n" % (target_conn, e.message)
+                "Error restoring %s: %s\n"
+                "Re-enable it via GNOME Settings -> Displays, or run this "
+                "script again (an inactive target gets enabled).\n"
+                % (target_conn, e.message)
             )
 
-sys.exit(0 if disabled else 1)
+sys.exit(0 if (disabled and restored) else 1)
 PYEOF
